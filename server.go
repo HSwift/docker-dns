@@ -2,13 +2,15 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
 	"github.com/miekg/dns"
 	"log"
 	"net"
-	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -18,25 +20,24 @@ type DockerCli struct {
 	*client.Client
 }
 
-type DockerDomain struct {
-	IPAddress string
-	names     []string
-}
-
 var dockerDomains map[string]string
 var updateLock sync.Mutex
+var serverMode bool
+var listenAddr string
+var domainSuffix string
 
 func (_ *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	msg := dns.Msg{}
 	msg.SetReply(r)
 	updateLock.Lock()
 	defer updateLock.Unlock()
-	log.Printf("%v",r.Question[0])
+	// log.Printf("%v",r.Question[0])
 	switch r.Question[0].Qtype {
 	case dns.TypeA:
 		msg.Authoritative = true
-		domain := msg.Question[0].Name
+		domain := strings.TrimRight(msg.Question[0].Name,domainSuffix)
 		address, ok := dockerDomains[domain]
+		domain = dns.Fqdn(msg.Question[0].Name)
 		if ok {
 			msg.Answer = append(msg.Answer, &dns.A{
 				Hdr: dns.RR_Header{Name: domain, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
@@ -47,19 +48,7 @@ func (_ *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	w.WriteMsg(&msg)
 }
 
-func convertToMap(input []DockerDomain) {
-	updateLock.Lock()
-	defer updateLock.Unlock()
-	log.Printf("update domain map")
-	dockerDomains = make(map[string]string, 0)
-	for _, domain := range input {
-		for _, name := range domain.names {
-			dockerDomains[dns.Fqdn(name+".d.com")] = domain.IPAddress
-		}
-	}
-}
-
-func (cli DockerCli) getNetworkName(containerID string) []DockerDomain {
+func (cli DockerCli) getNetworkName(containerID string) map[string]string {
 	filter := filters.NewArgs()
 	if containerID != "" {
 		filter.Add("id", containerID)
@@ -67,33 +56,33 @@ func (cli DockerCli) getNetworkName(containerID string) []DockerDomain {
 	containers, err := cli.ContainerList(context.Background(), types.ContainerListOptions{Filters: filter})
 	if err != nil {
 		log.Printf("error %v", err)
-		return []DockerDomain{}
+		return map[string]string{}
 	}
-	var results []DockerDomain = make([]DockerDomain, 0)
+	var nameSet = make(map[string]string, 0)
 	for i := range containers {
 		container, err := cli.ContainerInspect(context.Background(), containers[i].ID)
 		if err != nil {
 			log.Printf("error %v", err)
 			continue
 		}
-		var nameSet = make(map[string]struct{}, 2)
 		var IPAddress string
-		nameSet[container.ID[:12]] = struct{}{}
-		nameSet[container.Name[1:]] = struct{}{}
+
 		for networkName := range container.NetworkSettings.Networks {
 			network := container.NetworkSettings.Networks[networkName]
 			IPAddress = network.IPAddress
 			for _, alias := range network.Aliases {
-				nameSet[alias] = struct{}{}
+				nameSet[alias] = IPAddress
 			}
 		}
-		var names []string = make([]string, len(nameSet))
-		for k := range nameSet {
-			names = append(names, k)
-		}
-		results = append(results, DockerDomain{IPAddress, names})
+
+		nameSet[container.ID[:12]] = IPAddress
+		nameSet[container.Name[1:]] = IPAddress
 	}
-	return results
+	updateLock.Lock()
+	log.Printf("update domain map")
+	dockerDomains = nameSet
+	updateLock.Unlock()
+	return nameSet
 }
 
 func (cli DockerCli) eventListener() {
@@ -109,11 +98,11 @@ func (cli DockerCli) eventListener() {
 		case msg := <-messageChan:
 			switch msg.Action {
 			case "start", "unpause":
-				log.Printf("start %v",msg.ID[:12])
-				convertToMap(cli.getNetworkName(""))
+				log.Printf("start %v",msg.Actor.ID[:12])
+				cli.getNetworkName("")
 			case "pause", "die":
-				log.Printf("stop %v",msg.ID[:12])
-				convertToMap(cli.getNetworkName(""))
+				log.Printf("stop %v",msg.Actor.ID[:12])
+				cli.getNetworkName("")
 			}
 		case err := <-errorChan:
 			log.Fatal(err)
@@ -121,16 +110,37 @@ func (cli DockerCli) eventListener() {
 	}
 }
 
+func printResult(nameToResolve string) {
+	for k,v := range dockerDomains{
+		if nameToResolve == "" || strings.Contains(k,nameToResolve){
+			fmt.Printf("%s: %s\n", k,v)
+		}
+	}
+}
+
 func main() {
+	flag.BoolVar(&serverMode,"d",false,"run as DNS server")
+	flag.StringVar(&listenAddr,"l",":5300","address to listen, default :5300")
+	flag.StringVar(&domainSuffix,"s","d.com","domain suffix, default d.com")
+	flag.Parse()
+	name := flag.Args()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		panic(err)
 	}
-	convertToMap(DockerCli{cli}.getNetworkName(""))
-	go DockerCli{cli}.eventListener()
-	srv := &dns.Server{Addr: ":" + strconv.Itoa(53), Net: "udp"}
-	srv.Handler = &handler{}
-	if err := srv.ListenAndServe(); err != nil {
-		log.Fatalf("Failed to set udp listener %s\n", err.Error())
+	DockerCli{cli}.getNetworkName("")
+	if serverMode {
+		fmt.Printf("DNS server listening on %s\n",listenAddr)
+		go DockerCli{cli}.eventListener()
+		srv := &dns.Server{Addr: listenAddr, Net: "udp"}
+		srv.Handler = &handler{}
+		if err := srv.ListenAndServe(); err != nil {
+			log.Fatalf("Failed to set udp listener %s\n", err.Error())
+		}
+	}
+	if len(name) == 0 {
+		printResult("")
+	}else{
+		printResult(name[0])
 	}
 }
