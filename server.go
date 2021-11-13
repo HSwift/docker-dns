@@ -65,6 +65,9 @@ func (cli DockerCli) getNetworkName(containerID string) map[string]string {
 			log.Printf("error %v", err)
 			continue
 		}
+		if container.State.Running == false{
+			continue
+		}
 		var IPAddress string
 
 		for networkName := range container.NetworkSettings.Networks {
@@ -111,10 +114,14 @@ func (cli DockerCli) eventListener() {
 }
 
 func printResult(nameToResolve string) {
+	var sortedResult = make(map[string][]string, 0)
 	for k,v := range dockerDomains{
 		if nameToResolve == "" || strings.Contains(k,nameToResolve){
-			fmt.Printf("%s: %s\n", k,v)
+			sortedResult[v] = append(sortedResult[v],k)
 		}
+	}
+	for k,v := range sortedResult {
+		fmt.Printf("%s: %v\n",k,v)
 	}
 }
 
