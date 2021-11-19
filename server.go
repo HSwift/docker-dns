@@ -35,7 +35,7 @@ func (_ *handler) ServeDNS(w dns.ResponseWriter, r *dns.Msg) {
 	switch r.Question[0].Qtype {
 	case dns.TypeA:
 		msg.Authoritative = true
-		domain := strings.TrimRight(msg.Question[0].Name,domainSuffix)
+		domain := strings.TrimSuffix(msg.Question[0].Name,domainSuffix)
 		address, ok := dockerDomains[domain]
 		domain = dns.Fqdn(msg.Question[0].Name)
 		if ok {
@@ -131,6 +131,7 @@ func main() {
 	flag.StringVar(&domainSuffix,"s","d.com","domain suffix, default d.com")
 	flag.Parse()
 	name := flag.Args()
+	domainSuffix = "."+domainSuffix+"."
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		panic(err)
